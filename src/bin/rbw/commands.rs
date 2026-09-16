@@ -184,6 +184,8 @@ struct DecryptedListCipher {
     name: Option<String>,
     user: Option<String>,
     folder: Option<String>,
+    org: Option<String>,
+    collections: Option<Vec<String>>,
     uris: Option<Vec<String>>,
     #[serde(rename = "type")]
     entry_type: Option<String>,
@@ -330,6 +332,8 @@ impl From<DecryptedSearchCipher> for DecryptedListCipher {
             name: Some(value.name),
             user: value.user,
             folder: value.folder,
+            org: None,
+            collections: None,
             uris: Some(value.uris.into_iter().map(|(s, _)| s).collect()),
         }
     }
@@ -340,6 +344,8 @@ impl From<DecryptedSearchCipher> for DecryptedListCipher {
 struct DecryptedCipher {
     id: String,
     folder: Option<String>,
+    org: Option<String>,
+    collections: Vec<String>,
     name: String,
     data: DecryptedData,
     fields: Vec<DecryptedField>,
@@ -1184,6 +1190,8 @@ enum ListField {
     Name,
     User,
     Folder,
+    Org,
+    Collections,
     Uri,
     EntryType,
 }
@@ -1195,6 +1203,8 @@ impl ListField {
             Self::Name,
             Self::User,
             Self::Folder,
+            Self::Org,
+            Self::Collections,
             Self::Uri,
             Self::EntryType,
         ]
@@ -1210,6 +1220,8 @@ impl std::convert::TryFrom<&String> for ListField {
             "id" => Self::Id,
             "user" => Self::User,
             "folder" => Self::Folder,
+            "org" => Self::Org,
+            "collection" => Self::Collections,
             "type" => Self::EntryType,
             _ => return Err(anyhow::anyhow!("unknown field {s}")),
         })
@@ -1371,10 +1383,20 @@ pub fn list(fields: &[String], raw: bool) -> anyhow::Result<()> {
     unlock()?;
 
     let db = load_db()?;
+    let orgs = if fields.contains(&ListField::Org) {
+        org_map(&db)
+    } else {
+        std::collections::HashMap::new()
+    };
+    let collections = if fields.contains(&ListField::Collections) {
+        collection_map(&db, None)
+    } else {
+        std::collections::HashMap::new()
+    };
     let mut entries: Vec<DecryptedListCipher> = db
         .entries
         .iter()
-        .map(|entry| decrypt_list_cipher(entry, &fields))
+        .map(|entry| decrypt_list_cipher(entry, &fields, &orgs, &collections))
         .collect::<anyhow::Result<_>>()?;
     entries.sort_unstable_by(|a, b| a.name.cmp(&b.name));
 
@@ -1384,10 +1406,13 @@ pub fn list(fields: &[String], raw: bool) -> anyhow::Result<()> {
 }
 
 #[allow(clippy::fn_params_excessive_bools)]
+#[allow(clippy::too_many_arguments)]
 pub fn get(
     needle: Needle,
     user: Option<&str>,
     folder: Option<&str>,
+    org: Option<&str>,
+    collection: Option<&str>,
     field: Option<&str>,
     full: bool,
     raw: bool,
@@ -1406,7 +1431,7 @@ pub fn get(
     );
 
     let (_, decrypted) =
-        find_entry(&db, needle, user, folder, ignore_case)
+        find_entry(&db, needle, user, folder, org, collection, ignore_case)
             .with_context(|| format!("couldn't find entry for '{desc}'"))?;
     if list_fields {
         decrypted.display_fields_list();
@@ -1450,6 +1475,16 @@ fn print_entry_list(
                         String::new,
                         std::string::ToString::to_string,
                     ),
+                    ListField::Org => entry.org.as_ref().map_or_else(
+                        String::new,
+                        std::string::ToString::to_string,
+                    ),
+                    ListField::Collections => entry
+                        .collections
+                        .as_ref()
+                        .map_or_else(String::new, |collections| {
+                            collections.join(",")
+                        }),
                     ListField::Uri => {
                         // "uri" is not listed in the TryFrom
                         // implementation, so there's no way to try to
@@ -1485,6 +1520,8 @@ pub fn search(
     term: &str,
     fields: &[String],
     folder: Option<&str>,
+    org: Option<&str>,
+    collection: Option<&str>,
     raw: bool,
 ) -> anyhow::Result<()> {
     let fields: Vec<ListField> = if raw {
@@ -1500,17 +1537,53 @@ pub fn search(
 
     let db = load_db()?;
 
+    // build the collection name map at most once, shared between filter
+    // resolution and display
+    let collections =
+        if fields.contains(&ListField::Collections) || collection.is_some() {
+            collection_map(&db, None)
+        } else {
+            std::collections::HashMap::new()
+        };
+    let (org_ids, collection_ids) =
+        resolve_filters(&db, org, collection, Some(&collections), false)?;
+    let orgs = if fields.contains(&ListField::Org) {
+        org_map(&db)
+    } else {
+        std::collections::HashMap::new()
+    };
+
     let mut entries: Vec<DecryptedListCipher> = db
         .entries
         .iter()
-        .map(decrypt_search_cipher)
         .filter(|entry| {
-            entry
-                .as_ref()
-                .map(|entry| entry.search_match(term, folder))
-                .unwrap_or(true)
+            entry_matches_filters(
+                entry,
+                org_ids.as_ref(),
+                collection_ids.as_ref(),
+            )
         })
-        .map(|entry| entry.map(std::convert::Into::into))
+        .map(|entry| {
+            decrypt_search_cipher(entry).map(|decrypted| (entry, decrypted))
+        })
+        .filter(|res| {
+            res.as_ref().map_or(true, |(_, decrypted)| {
+                decrypted.search_match(term, folder)
+            })
+        })
+        .map(|res| {
+            res.map(|(entry, decrypted)| {
+                let mut list_cipher: DecryptedListCipher = decrypted.into();
+                if fields.contains(&ListField::Org) {
+                    list_cipher.org = entry_org_name(entry, &orgs);
+                }
+                if fields.contains(&ListField::Collections) {
+                    list_cipher.collections =
+                        Some(entry_collection_names(entry, &collections));
+                }
+                list_cipher
+            })
+        })
         .collect::<Result<_, anyhow::Error>>()?;
     entries.sort_unstable_by(|a, b| a.name.cmp(&b.name));
 
@@ -1523,6 +1596,8 @@ pub fn code(
     needle: Needle,
     user: Option<&str>,
     folder: Option<&str>,
+    org: Option<&str>,
+    collection: Option<&str>,
     clipboard: bool,
     ignore_case: bool,
 ) -> anyhow::Result<()> {
@@ -1537,7 +1612,7 @@ pub fn code(
     );
 
     let (_, decrypted) =
-        find_entry(&db, needle, user, folder, ignore_case)
+        find_entry(&db, needle, user, folder, org, collection, ignore_case)
             .with_context(|| format!("couldn't find entry for '{desc}'"))?;
 
     if let DecryptedData::Login { totp, .. } = decrypted.data {
@@ -1754,6 +1829,8 @@ pub fn edit(
     name: Needle,
     username: Option<&str>,
     folder: Option<&str>,
+    org: Option<&str>,
+    collection: Option<&str>,
     ignore_case: bool,
 ) -> anyhow::Result<()> {
     unlock()?;
@@ -1769,7 +1846,7 @@ pub fn edit(
     );
 
     let (entry, decrypted) =
-        find_entry(&db, name, username, folder, ignore_case)
+        find_entry(&db, name, username, folder, org, collection, ignore_case)
             .with_context(|| format!("couldn't find entry for '{desc}'"))?;
 
     let (data, fields, notes, history) = match &decrypted.data {
@@ -1879,6 +1956,8 @@ pub fn remove(
     name: Needle,
     username: Option<&str>,
     folder: Option<&str>,
+    org: Option<&str>,
+    collection: Option<&str>,
     ignore_case: bool,
 ) -> anyhow::Result<()> {
     unlock()?;
@@ -1893,8 +1972,9 @@ pub fn remove(
         name
     );
 
-    let (entry, _) = find_entry(&db, name, username, folder, ignore_case)
-        .with_context(|| format!("couldn't find entry for '{desc}'"))?;
+    let (entry, _) =
+        find_entry(&db, name, username, folder, org, collection, ignore_case)
+            .with_context(|| format!("couldn't find entry for '{desc}'"))?;
 
     if let (Some(access_token), ()) =
         rbw::actions::remove(access_token, refresh_token, &entry.id)?
@@ -1912,6 +1992,8 @@ pub fn history(
     name: Needle,
     username: Option<&str>,
     folder: Option<&str>,
+    org: Option<&str>,
+    collection: Option<&str>,
     ignore_case: bool,
 ) -> anyhow::Result<()> {
     unlock()?;
@@ -1924,8 +2006,9 @@ pub fn history(
         name
     );
 
-    let (_, decrypted) = find_entry(&db, name, username, folder, ignore_case)
-        .with_context(|| format!("couldn't find entry for '{desc}'"))?;
+    let (_, decrypted) =
+        find_entry(&db, name, username, folder, org, collection, ignore_case)
+            .with_context(|| format!("couldn't find entry for '{desc}'"))?;
     for history in decrypted.history {
         println!("{}: {}", history.last_used_date, history.password);
     }
@@ -2015,12 +2098,24 @@ fn find_entry(
     mut needle: Needle,
     username: Option<&str>,
     folder: Option<&str>,
+    org: Option<&str>,
+    collection: Option<&str>,
     ignore_case: bool,
 ) -> anyhow::Result<(rbw::db::Entry, DecryptedCipher)> {
+    let (org_ids, collection_ids) =
+        resolve_filters(db, org, collection, None, ignore_case)?;
+
     if let Needle::Uuid(uuid, s) = needle {
         for cipher in &db.entries {
             if uuid::Uuid::parse_str(&cipher.id) == Ok(uuid) {
-                return Ok((cipher.clone(), decrypt_cipher(cipher)?));
+                if !entry_matches_filters(
+                    cipher,
+                    org_ids.as_ref(),
+                    collection_ids.as_ref(),
+                ) {
+                    return Err(anyhow::anyhow!("no entry found"));
+                }
+                return Ok((cipher.clone(), decrypt_cipher(cipher, db)?));
             }
         }
         needle = Needle::Name(s);
@@ -2029,6 +2124,13 @@ fn find_entry(
     let ciphers: Vec<(rbw::db::Entry, DecryptedSearchCipher)> = db
         .entries
         .iter()
+        .filter(|entry| {
+            entry_matches_filters(
+                entry,
+                org_ids.as_ref(),
+                collection_ids.as_ref(),
+            )
+        })
         .map(|entry| {
             decrypt_search_cipher(entry)
                 .map(|decrypted| (entry.clone(), decrypted))
@@ -2036,7 +2138,7 @@ fn find_entry(
         .collect::<anyhow::Result<_>>()?;
     let (entry, _) =
         find_entry_raw(&ciphers, &needle, username, folder, ignore_case)?;
-    let decrypted_entry = decrypt_cipher(&entry)?;
+    let decrypted_entry = decrypt_cipher(&entry, db)?;
     Ok((entry, decrypted_entry))
 }
 
@@ -2122,9 +2224,187 @@ fn decrypt_field(
     }
 }
 
+fn org_map(db: &rbw::db::Db) -> std::collections::HashMap<String, String> {
+    db.organizations
+        .iter()
+        .map(|org| (org.id.clone(), org.name.clone()))
+        .collect()
+}
+
+fn org_name(db: &rbw::db::Db, org_id: &str) -> String {
+    db.organizations
+        .iter()
+        .find(|org| org.id == org_id)
+        .map_or_else(|| org_id.to_string(), |org| org.name.clone())
+}
+
+// collection names are encrypted with the organization key, unlike folder
+// names. failure to decrypt a single collection name shouldn't break
+// displaying entries entirely, so fall back to displaying the collection id
+// in that case.
+fn decrypt_collection_name(collection: &rbw::db::Collection) -> String {
+    crate::actions::decrypt(&collection.name, None, Some(&collection.org_id))
+        .unwrap_or_else(|e| {
+            log::warn!("failed to decrypt collection name: {e}");
+            collection.id.clone()
+        })
+}
+
+// decrypts each collection name once (each decryption is an agent round
+// trip), optionally restricted to the collections of a single organization
+fn collection_map(
+    db: &rbw::db::Db,
+    org_id: Option<&str>,
+) -> std::collections::HashMap<String, String> {
+    db.collections
+        .iter()
+        .filter(|collection| {
+            org_id.is_none_or(|org_id| collection.org_id == org_id)
+        })
+        .map(|collection| {
+            (collection.id.clone(), decrypt_collection_name(collection))
+        })
+        .collect()
+}
+
+fn entry_org_name(
+    entry: &rbw::db::Entry,
+    orgs: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    entry.org_id.as_ref().map(|org_id| {
+        orgs.get(org_id).cloned().unwrap_or_else(|| org_id.clone())
+    })
+}
+
+fn entry_collection_names(
+    entry: &rbw::db::Entry,
+    collections: &std::collections::HashMap<String, String>,
+) -> Vec<String> {
+    entry
+        .collection_ids
+        .iter()
+        .map(|id| collections.get(id).cloned().unwrap_or_else(|| id.clone()))
+        .collect()
+}
+
+fn match_name(name: &str, given_name: &str, ignore_case: bool) -> bool {
+    if ignore_case {
+        name.to_lowercase() == given_name.to_lowercase()
+    } else {
+        name == given_name
+    }
+}
+
+fn resolve_org_filter(
+    organizations: &[rbw::db::Org],
+    name: &str,
+    ignore_case: bool,
+) -> anyhow::Result<std::collections::HashSet<String>> {
+    let org_ids: std::collections::HashSet<String> = organizations
+        .iter()
+        .filter(|org| match_name(&org.name, name, ignore_case))
+        .map(|org| org.id.clone())
+        .collect();
+    if org_ids.is_empty() {
+        let known: Vec<&str> =
+            organizations.iter().map(|org| org.name.as_str()).collect();
+        Err(anyhow::anyhow!(
+            "no organization found matching '{}' (known organizations: {})",
+            name,
+            known.join(", ")
+        ))
+    } else {
+        Ok(org_ids)
+    }
+}
+
+fn resolve_collection_filter(
+    collections: &[rbw::db::Collection],
+    names: &std::collections::HashMap<String, String>,
+    org_ids: Option<&std::collections::HashSet<String>>,
+    name: &str,
+    ignore_case: bool,
+) -> anyhow::Result<std::collections::HashSet<String>> {
+    let candidates: Vec<&rbw::db::Collection> = collections
+        .iter()
+        .filter(|collection| {
+            org_ids.is_none_or(|ids| ids.contains(&collection.org_id))
+        })
+        .collect();
+    let collection_ids: std::collections::HashSet<String> = candidates
+        .iter()
+        .filter(|collection| {
+            names
+                .get(&collection.id)
+                .is_some_and(|n| match_name(n, name, ignore_case))
+        })
+        .map(|collection| collection.id.clone())
+        .collect();
+    if collection_ids.is_empty() {
+        let known: Vec<&str> = candidates
+            .iter()
+            .filter_map(|collection| {
+                names.get(&collection.id).map(String::as_str)
+            })
+            .collect();
+        Err(anyhow::anyhow!(
+            "no collection found matching '{}' (known collections: {})",
+            name,
+            known.join(", ")
+        ))
+    } else {
+        Ok(collection_ids)
+    }
+}
+
+type EntryFilters = (
+    Option<std::collections::HashSet<String>>,
+    Option<std::collections::HashSet<String>>,
+);
+
+fn resolve_filters(
+    db: &rbw::db::Db,
+    org: Option<&str>,
+    collection: Option<&str>,
+    collection_names: Option<&std::collections::HashMap<String, String>>,
+    ignore_case: bool,
+) -> anyhow::Result<EntryFilters> {
+    let org_ids = org
+        .map(|name| resolve_org_filter(&db.organizations, name, ignore_case))
+        .transpose()?;
+    let collection_ids = collection
+        .map(|name| {
+            let owned =
+                collection_names.is_none().then(|| collection_map(db, None));
+            resolve_collection_filter(
+                &db.collections,
+                collection_names.or(owned.as_ref()).unwrap(),
+                org_ids.as_ref(),
+                name,
+                ignore_case,
+            )
+        })
+        .transpose()?;
+    Ok((org_ids, collection_ids))
+}
+
+fn entry_matches_filters(
+    entry: &rbw::db::Entry,
+    org_ids: Option<&std::collections::HashSet<String>>,
+    collection_ids: Option<&std::collections::HashSet<String>>,
+) -> bool {
+    org_ids.is_none_or(|ids| {
+        entry.org_id.as_ref().is_some_and(|id| ids.contains(id))
+    }) && collection_ids.is_none_or(|ids| {
+        entry.collection_ids.iter().any(|id| ids.contains(id))
+    })
+}
+
 fn decrypt_list_cipher(
     entry: &rbw::db::Entry,
     fields: &[ListField],
+    orgs: &std::collections::HashMap<String, String>,
+    collections: &std::collections::HashMap<String, String>,
 ) -> anyhow::Result<DecryptedListCipher> {
     let id = entry.id.clone();
     let name = if fields.contains(&ListField::Name) {
@@ -2157,6 +2437,16 @@ fn decrypt_list_cipher(
             .as_ref()
             .map(|folder| crate::actions::decrypt(folder, None, None))
             .transpose()?
+    } else {
+        None
+    };
+    let org = if fields.contains(&ListField::Org) {
+        entry_org_name(entry, orgs)
+    } else {
+        None
+    };
+    let collections = if fields.contains(&ListField::Collections) {
+        Some(entry_collection_names(entry, collections))
     } else {
         None
     };
@@ -2195,6 +2485,8 @@ fn decrypt_list_cipher(
         name,
         user,
         folder,
+        org,
+        collections,
         uris,
         entry_type,
     })
@@ -2297,7 +2589,10 @@ fn decrypt_search_cipher(
     })
 }
 
-fn decrypt_cipher(entry: &rbw::db::Entry) -> anyhow::Result<DecryptedCipher> {
+fn decrypt_cipher(
+    entry: &rbw::db::Entry,
+    db: &rbw::db::Db,
+) -> anyhow::Result<DecryptedCipher> {
     // folder name should always be decrypted with the local key because
     // folders are local to a specific user's vault, not the organization
     let folder = entry
@@ -2312,6 +2607,21 @@ fn decrypt_cipher(entry: &rbw::db::Entry) -> anyhow::Result<DecryptedCipher> {
             None
         }
     };
+    let org = entry.org_id.as_ref().map(|org_id| org_name(db, org_id));
+    // only decrypt the names of the collections this entry belongs to
+    let collections = entry
+        .collection_ids
+        .iter()
+        .map(|collection_id| {
+            db.collections
+                .iter()
+                .find(|collection| &collection.id == collection_id)
+                .map_or_else(
+                    || collection_id.clone(),
+                    decrypt_collection_name,
+                )
+        })
+        .collect();
     let fields = entry
         .fields
         .iter()
@@ -2614,6 +2924,8 @@ fn decrypt_cipher(entry: &rbw::db::Entry) -> anyhow::Result<DecryptedCipher> {
     Ok(DecryptedCipher {
         id: entry.id.clone(),
         folder,
+        org,
+        collections,
         name: crate::actions::decrypt(
             &entry.name,
             entry.key.as_deref(),
@@ -4175,5 +4487,204 @@ mod test {
                 notes: None,
             },
         )
+    }
+
+    fn make_orgs_and_collections(
+    ) -> (Vec<rbw::db::Org>, Vec<rbw::db::Collection>) {
+        let organizations = vec![
+            rbw::db::Org {
+                id: "org-id-1".to_string(),
+                name: "org one".to_string(),
+            },
+            rbw::db::Org {
+                id: "org-id-2".to_string(),
+                name: "org two".to_string(),
+            },
+        ];
+        let collections = vec![
+            rbw::db::Collection {
+                id: "collection-id-1".to_string(),
+                org_id: "org-id-1".to_string(),
+                name: "encrypted-name-1".to_string(),
+            },
+            rbw::db::Collection {
+                id: "collection-id-2".to_string(),
+                org_id: "org-id-2".to_string(),
+                name: "encrypted-name-2".to_string(),
+            },
+            rbw::db::Collection {
+                id: "collection-id-3".to_string(),
+                org_id: "org-id-2".to_string(),
+                name: "encrypted-name-3".to_string(),
+            },
+        ];
+        (organizations, collections)
+    }
+
+    fn collection_names() -> std::collections::HashMap<String, String> {
+        [
+            ("collection-id-1", "shared"),
+            ("collection-id-2", "shared"),
+            ("collection-id-3", "admin passwords"),
+        ]
+        .iter()
+        .map(|(id, name)| ((*id).to_string(), (*name).to_string()))
+        .collect()
+    }
+
+    #[test]
+    fn test_resolve_org_filter() {
+        let (organizations, _) = make_orgs_and_collections();
+
+        assert_eq!(
+            resolve_org_filter(&organizations, "org one", false).unwrap(),
+            std::iter::once("org-id-1".to_string()).collect()
+        );
+        assert_eq!(
+            resolve_org_filter(&organizations, "ORG Two", true).unwrap(),
+            std::iter::once("org-id-2".to_string()).collect()
+        );
+        // exact match required, no substring matching
+        assert!(resolve_org_filter(&organizations, "org", false).is_err());
+        // case sensitive without ignore_case
+        assert!(resolve_org_filter(&organizations, "ORG Two", false).is_err());
+        let err = resolve_org_filter(&organizations, "nonexistent", false)
+            .unwrap_err();
+        assert!(err.to_string().contains("org one"));
+        assert!(err.to_string().contains("org two"));
+    }
+
+    #[test]
+    fn test_resolve_collection_filter() {
+        let (_, collections) = make_orgs_and_collections();
+        let names = collection_names();
+
+        // both orgs have a collection named "shared"
+        assert_eq!(
+            resolve_collection_filter(
+                &collections,
+                &names,
+                None,
+                "shared",
+                false
+            )
+            .unwrap(),
+            ["collection-id-1".to_string(), "collection-id-2".to_string()]
+                .into_iter()
+                .collect()
+        );
+        // restricting to an org restricts the candidates
+        let org_ids: std::collections::HashSet<String> =
+            std::iter::once("org-id-1".to_string()).collect();
+        assert_eq!(
+            resolve_collection_filter(
+                &collections,
+                &names,
+                Some(&org_ids),
+                "shared",
+                false
+            )
+            .unwrap(),
+            std::iter::once("collection-id-1".to_string()).collect()
+        );
+        assert_eq!(
+            resolve_collection_filter(
+                &collections,
+                &names,
+                None,
+                "ADMIN Passwords",
+                true
+            )
+            .unwrap(),
+            std::iter::once("collection-id-3".to_string()).collect()
+        );
+        // "admin passwords" only exists in org two
+        let err = resolve_collection_filter(
+            &collections,
+            &names,
+            Some(&org_ids),
+            "admin passwords",
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("shared"));
+        assert!(!err.to_string().contains("admin passwords ("));
+    }
+
+    #[test]
+    fn test_entry_matches_filters() {
+        let (mut entry, _) = make_entry("name", None, None, &[]);
+        let org_ids: std::collections::HashSet<String> =
+            std::iter::once("org-id-1".to_string()).collect();
+        let collection_ids: std::collections::HashSet<String> =
+            std::iter::once("collection-id-1".to_string()).collect();
+
+        // no filters matches everything
+        assert!(entry_matches_filters(&entry, None, None));
+        // a personal entry doesn't match any org or collection filter
+        assert!(!entry_matches_filters(&entry, Some(&org_ids), None));
+        assert!(!entry_matches_filters(&entry, None, Some(&collection_ids)));
+
+        entry.org_id = Some("org-id-1".to_string());
+        assert!(entry_matches_filters(&entry, Some(&org_ids), None));
+        // an org entry without collections ("unassigned") doesn't match any
+        // collection filter
+        assert!(!entry_matches_filters(&entry, None, Some(&collection_ids)));
+
+        entry.collection_ids = vec![
+            "collection-id-1".to_string(),
+            "collection-id-2".to_string(),
+        ];
+        assert!(entry_matches_filters(
+            &entry,
+            Some(&org_ids),
+            Some(&collection_ids)
+        ));
+
+        entry.org_id = Some("org-id-2".to_string());
+        assert!(!entry_matches_filters(&entry, Some(&org_ids), None));
+        assert!(entry_matches_filters(&entry, None, Some(&collection_ids)));
+    }
+
+    #[test]
+    fn test_find_entry_uuid_respects_filters() {
+        let (organizations, collections) = make_orgs_and_collections();
+        let (entry, _) = make_entry("name", None, None, &[]);
+        let uuid = uuid::Uuid::parse_str(&entry.id).unwrap();
+        let mut db = rbw::db::Db::new();
+        db.organizations = organizations;
+        db.collections = collections;
+        db.entries = vec![entry];
+
+        // a uuid lookup with an org filter the entry doesn't match must
+        // fail instead of ignoring the filter
+        let err = find_entry(
+            &db,
+            Needle::Uuid(uuid, uuid.to_string()),
+            None,
+            None,
+            Some("org one"),
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("no entry found"), "{err}");
+
+        // and the filter names must be validated for uuid lookups too
+        let err = find_entry(
+            &db,
+            Needle::Uuid(uuid, uuid.to_string()),
+            None,
+            None,
+            Some("nonexistent"),
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("no organization found matching 'nonexistent'"),
+            "{err}"
+        );
     }
 }

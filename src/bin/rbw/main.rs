@@ -15,6 +15,10 @@ struct FindArgs {
     user: Option<String>,
     #[arg(long, help = "Folder name to search in")]
     folder: Option<String>,
+    #[arg(long, help = "Organization name to search in")]
+    org: Option<String>,
+    #[arg(long, help = "Collection name to search in")]
+    collection: Option<String>,
     #[arg(short, long, help = "Ignore case")]
     ignorecase: bool,
 }
@@ -59,7 +63,8 @@ enum Opt {
         #[arg(
             long,
             help = "Fields to display. \
-                Available options are id, name, user, folder, type. \
+                Available options are id, name, user, folder, org, \
+                collection, type. \
                 Multiple fields will be separated by tabs.",
             default_value = "name",
             use_value_delimiter = true
@@ -93,7 +98,8 @@ enum Opt {
         #[arg(
             long,
             help = "Fields to display. \
-                Available options are id, name, user, folder. \
+                Available options are id, name, user, folder, org, \
+                collection. \
                 Multiple fields will be separated by tabs.",
             default_value = "name",
             use_value_delimiter = true
@@ -101,6 +107,10 @@ enum Opt {
         fields: Vec<String>,
         #[arg(long, help = "Folder name to search in")]
         folder: Option<String>,
+        #[arg(long, help = "Organization name to search in")]
+        org: Option<String>,
+        #[arg(long, help = "Collection name to search in")]
+        collection: Option<String>,
         #[structopt(long, help = "Display output as JSON")]
         raw: bool,
     },
@@ -350,6 +360,8 @@ fn main() {
             find_args.needle.clone(),
             find_args.user.as_deref(),
             find_args.folder.as_deref(),
+            find_args.org.as_deref(),
+            find_args.collection.as_deref(),
             field.as_deref(),
             full,
             raw,
@@ -364,8 +376,17 @@ fn main() {
             term,
             fields,
             folder,
+            org,
+            collection,
             raw,
-        } => commands::search(&term, &fields, folder.as_deref(), raw),
+        } => commands::search(
+            &term,
+            &fields,
+            folder.as_deref(),
+            org.as_deref(),
+            collection.as_deref(),
+            raw,
+        ),
         Opt::Code {
             find_args,
             #[cfg(feature = "clipboard")]
@@ -374,6 +395,8 @@ fn main() {
             find_args.needle,
             find_args.user.as_deref(),
             find_args.folder.as_deref(),
+            find_args.org.as_deref(),
+            find_args.collection.as_deref(),
             #[cfg(feature = "clipboard")]
             clipboard,
             #[cfg(not(feature = "clipboard"))]
@@ -434,18 +457,24 @@ fn main() {
             find_args.needle,
             find_args.user.as_deref(),
             find_args.folder.as_deref(),
+            find_args.org.as_deref(),
+            find_args.collection.as_deref(),
             find_args.ignorecase,
         ),
         Opt::Remove { find_args } => commands::remove(
             find_args.needle,
             find_args.user.as_deref(),
             find_args.folder.as_deref(),
+            find_args.org.as_deref(),
+            find_args.collection.as_deref(),
             find_args.ignorecase,
         ),
         Opt::History { find_args } => commands::history(
             find_args.needle,
             find_args.user.as_deref(),
             find_args.folder.as_deref(),
+            find_args.org.as_deref(),
+            find_args.collection.as_deref(),
             find_args.ignorecase,
         ),
         Opt::Lock => commands::lock(),
