@@ -136,15 +136,7 @@ pub fn unlock<S: std::hash::BuildHasher>(
 pub async fn sync(
     access_token: &str,
     refresh_token: &str,
-) -> Result<(
-    Option<String>,
-    (
-        String,
-        String,
-        std::collections::HashMap<String, String>,
-        Vec<crate::db::Entry>,
-    ),
-)> {
+) -> Result<(Option<String>, crate::api::SyncData)> {
     with_exchange_refresh_token_async(
         access_token,
         refresh_token,
@@ -156,14 +148,7 @@ pub async fn sync(
     .await
 }
 
-async fn sync_once(
-    access_token: &str,
-) -> Result<(
-    String,
-    String,
-    std::collections::HashMap<String, String>,
-    Vec<crate::db::Entry>,
-)> {
+async fn sync_once(access_token: &str) -> Result<crate::api::SyncData> {
     let (client, _) = api_client_async().await?;
     client.sync(access_token).await
 }

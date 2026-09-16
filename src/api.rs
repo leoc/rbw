@@ -386,6 +386,16 @@ struct SendEmailLoginReq {
     sso_email_2fa_session_token: String,
 }
 
+#[derive(Debug)]
+pub struct SyncData {
+    pub protected_key: String,
+    pub protected_private_key: String,
+    pub protected_org_keys: std::collections::HashMap<String, String>,
+    pub organizations: Vec<crate::db::Org>,
+    pub collections: Vec<crate::db::Collection>,
+    pub entries: Vec<crate::db::Entry>,
+}
+
 #[derive(serde::Deserialize, Debug)]
 struct SyncRes {
     #[serde(rename = "Ciphers", alias = "ciphers")]
@@ -394,6 +404,8 @@ struct SyncRes {
     profile: SyncResProfile,
     #[serde(rename = "Folders", alias = "folders")]
     folders: Vec<SyncResFolder>,
+    #[serde(rename = "Collections", alias = "collections", default)]
+    collections: Vec<SyncResCollection>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -404,6 +416,8 @@ struct SyncResCipher {
     folder_id: Option<String>,
     #[serde(rename = "OrganizationId", alias = "organizationId")]
     organization_id: Option<String>,
+    #[serde(rename = "CollectionIds", alias = "collectionIds", default)]
+    collection_ids: Option<Vec<String>>,
     #[serde(rename = "Name", alias = "name")]
     name: String,
     #[serde(rename = "Login", alias = "login")]
@@ -542,6 +556,7 @@ impl SyncResCipher {
         Some(crate::db::Entry {
             id: self.id.clone(),
             org_id: self.organization_id.clone(),
+            collection_ids: self.collection_ids.clone().unwrap_or_default(),
             folder,
             folder_id: folder_id.map(std::string::ToString::to_string),
             name: self.name.clone(),
@@ -571,6 +586,19 @@ struct SyncResProfileOrganization {
     id: String,
     #[serde(rename = "Key", alias = "key")]
     key: String,
+    // defensive: don't fail the whole sync on a server that omits the name
+    #[serde(rename = "Name", alias = "name", default)]
+    name: String,
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct SyncResCollection {
+    #[serde(rename = "Id", alias = "id")]
+    id: String,
+    #[serde(rename = "OrganizationId", alias = "organizationId")]
+    organization_id: String,
+    #[serde(rename = "Name", alias = "name")]
+    name: String,
 }
 
 #[derive(serde::Deserialize, Debug, Clone)]
@@ -1145,15 +1173,7 @@ impl Client {
         Ok((sso_code, sso_code_verifier, callback_url))
     }
 
-    pub async fn sync(
-        &self,
-        access_token: &str,
-    ) -> Result<(
-        String,
-        String,
-        std::collections::HashMap<String, String>,
-        Vec<crate::db::Entry>,
-    )> {
+    pub async fn sync(&self, access_token: &str) -> Result<SyncData> {
         let client = self.reqwest_client().await?;
         let res = client
             .get(self.api_url("/sync"))
@@ -1167,23 +1187,47 @@ impl Client {
             reqwest::StatusCode::OK => {
                 let sync_res: SyncRes = res.json_with_path().await?;
                 let folders = sync_res.folders.clone();
-                let ciphers = sync_res
+                let entries = sync_res
                     .ciphers
                     .iter()
                     .filter_map(|cipher| cipher.to_entry(&folders))
                     .collect();
-                let org_keys = sync_res
+                let protected_org_keys = sync_res
                     .profile
                     .organizations
                     .iter()
                     .map(|org| (org.id.clone(), org.key.clone()))
                     .collect();
-                Ok((
-                    sync_res.profile.key,
-                    sync_res.profile.private_key,
-                    org_keys,
-                    ciphers,
-                ))
+                let organizations = sync_res
+                    .profile
+                    .organizations
+                    .iter()
+                    .map(|org| crate::db::Org {
+                        id: org.id.clone(),
+                        name: if org.name.is_empty() {
+                            org.id.clone()
+                        } else {
+                            org.name.clone()
+                        },
+                    })
+                    .collect();
+                let collections = sync_res
+                    .collections
+                    .iter()
+                    .map(|collection| crate::db::Collection {
+                        id: collection.id.clone(),
+                        org_id: collection.organization_id.clone(),
+                        name: collection.name.clone(),
+                    })
+                    .collect();
+                Ok(SyncData {
+                    protected_key: sync_res.profile.key,
+                    protected_private_key: sync_res.profile.private_key,
+                    protected_org_keys,
+                    organizations,
+                    collections,
+                    entries,
+                })
             }
             reqwest::StatusCode::UNAUTHORIZED => {
                 Err(Error::RequestUnauthorized)
@@ -1765,4 +1809,182 @@ fn classify_login_error(error_res: &ConnectErrorRes, code: u16) -> Error {
 
     log::warn!("unexpected error received during login: {error_res:?}");
     Error::RequestFailed { status: code }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sync_res_camel_case() -> &'static str {
+        r#"{
+            "ciphers": [{
+                "id": "cipher-id",
+                "folderId": null,
+                "organizationId": "org-id",
+                "collectionIds": ["collection-id-1", "collection-id-2"],
+                "name": "encrypted-name",
+                "login": {
+                    "username": null,
+                    "password": null,
+                    "totp": null,
+                    "uris": null
+                },
+                "notes": null,
+                "passwordHistory": null,
+                "fields": null,
+                "deletedDate": null,
+                "key": null,
+                "reprompt": 0
+            }],
+            "profile": {
+                "key": "profile-key",
+                "privateKey": "profile-private-key",
+                "organizations": [{
+                    "id": "org-id",
+                    "key": "org-key",
+                    "name": "org-name"
+                }]
+            },
+            "folders": [],
+            "collections": [{
+                "id": "collection-id-1",
+                "organizationId": "org-id",
+                "name": "encrypted-collection-name",
+                "readOnly": false
+            }]
+        }"#
+    }
+
+    fn sync_res_pascal_case() -> &'static str {
+        r#"{
+            "Ciphers": [{
+                "Id": "cipher-id",
+                "FolderId": null,
+                "OrganizationId": "org-id",
+                "CollectionIds": ["collection-id-1", "collection-id-2"],
+                "Name": "encrypted-name",
+                "Login": {
+                    "Username": null,
+                    "Password": null,
+                    "Totp": null,
+                    "Uris": null
+                },
+                "Notes": null,
+                "PasswordHistory": null,
+                "Fields": null,
+                "DeletedDate": null,
+                "Key": null,
+                "Reprompt": 0
+            }],
+            "Profile": {
+                "Key": "profile-key",
+                "PrivateKey": "profile-private-key",
+                "Organizations": [{
+                    "Id": "org-id",
+                    "Key": "org-key",
+                    "Name": "org-name"
+                }]
+            },
+            "Folders": [],
+            "Collections": [{
+                "Id": "collection-id-1",
+                "OrganizationId": "org-id",
+                "Name": "encrypted-collection-name",
+                "ReadOnly": false
+            }]
+        }"#
+    }
+
+    fn assert_sync_res(sync_res: &SyncRes) {
+        assert_eq!(sync_res.profile.organizations.len(), 1);
+        assert_eq!(sync_res.profile.organizations[0].id, "org-id");
+        assert_eq!(sync_res.profile.organizations[0].name, "org-name");
+
+        assert_eq!(sync_res.collections.len(), 1);
+        assert_eq!(sync_res.collections[0].id, "collection-id-1");
+        assert_eq!(sync_res.collections[0].organization_id, "org-id");
+        assert_eq!(sync_res.collections[0].name, "encrypted-collection-name");
+
+        assert_eq!(sync_res.ciphers.len(), 1);
+        let entry = sync_res.ciphers[0].to_entry(&[]).unwrap();
+        assert_eq!(entry.org_id.as_deref(), Some("org-id"));
+        assert_eq!(
+            entry.collection_ids,
+            vec![
+                "collection-id-1".to_string(),
+                "collection-id-2".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_sync_res_camel_case() {
+        let sync_res: SyncRes =
+            serde_json::from_str(sync_res_camel_case()).unwrap();
+        assert_sync_res(&sync_res);
+    }
+
+    #[test]
+    fn test_parse_sync_res_pascal_case() {
+        let sync_res: SyncRes =
+            serde_json::from_str(sync_res_pascal_case()).unwrap();
+        assert_sync_res(&sync_res);
+    }
+
+    // servers may omit the collections array and per-cipher collectionIds
+    #[test]
+    fn test_parse_sync_res_without_collections() {
+        let json = r#"{
+            "ciphers": [{
+                "id": "cipher-id",
+                "folderId": null,
+                "organizationId": null,
+                "name": "encrypted-name",
+                "login": {
+                    "username": null,
+                    "password": null,
+                    "totp": null,
+                    "uris": null
+                },
+                "notes": null,
+                "passwordHistory": null,
+                "fields": null,
+                "deletedDate": null,
+                "key": null,
+                "reprompt": 0
+            }],
+            "profile": {
+                "key": "profile-key",
+                "privateKey": "profile-private-key",
+                "organizations": []
+            },
+            "folders": []
+        }"#;
+        let sync_res: SyncRes = serde_json::from_str(json).unwrap();
+        assert!(sync_res.collections.is_empty());
+        let entry = sync_res.ciphers[0].to_entry(&[]).unwrap();
+        assert_eq!(entry.org_id, None);
+        assert!(entry.collection_ids.is_empty());
+    }
+
+    // a server that omits organization names must not fail the whole sync
+    #[test]
+    fn test_parse_sync_res_without_org_name() {
+        let json = r#"{
+            "ciphers": [],
+            "profile": {
+                "key": "profile-key",
+                "privateKey": "profile-private-key",
+                "organizations": [{
+                    "id": "org-id",
+                    "key": "org-key"
+                }]
+            },
+            "folders": []
+        }"#;
+        let sync_res: SyncRes = serde_json::from_str(json).unwrap();
+        assert_eq!(sync_res.profile.organizations.len(), 1);
+        assert_eq!(sync_res.profile.organizations[0].id, "org-id");
+        assert_eq!(sync_res.profile.organizations[0].name, "");
+    }
 }

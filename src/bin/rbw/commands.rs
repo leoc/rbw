@@ -4135,6 +4135,7 @@ mod test {
             rbw::db::Entry {
                 id: id.to_string(),
                 org_id: None,
+                collection_ids: vec![],
                 folder: folder.map(|_| "encrypted folder name".to_string()),
                 folder_id: None,
                 name: "this is the encrypted name".to_string(),
