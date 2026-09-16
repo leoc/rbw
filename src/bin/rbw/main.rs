@@ -149,6 +149,21 @@ enum Opt {
         uri: Vec<String>,
         #[arg(long, help = "Folder for the password entry")]
         folder: Option<String>,
+        #[arg(
+            long,
+            help = "Organization for the password entry \
+                (requires --collection)",
+            requires = "collection"
+        )]
+        org: Option<String>,
+        #[arg(
+            long,
+            help = "Collection for the password entry \
+                (requires --org, may be given multiple times)",
+            number_of_values = 1,
+            requires = "org"
+        )]
+        collection: Vec<String>,
     },
 
     #[command(
@@ -179,6 +194,21 @@ enum Opt {
         uri: Vec<String>,
         #[arg(long, help = "Folder for the password entry")]
         folder: Option<String>,
+        #[arg(
+            long,
+            help = "Organization for the password entry \
+                (requires --collection)",
+            requires = "collection"
+        )]
+        org: Option<String>,
+        #[arg(
+            long,
+            help = "Collection for the password entry \
+                (requires --org, may be given multiple times)",
+            number_of_values = 1,
+            requires = "org"
+        )]
+        collection: Vec<String>,
         #[arg(
             long = "no-symbols",
             help = "Generate a password with no special characters"
@@ -408,6 +438,8 @@ fn main() {
             user,
             uri,
             folder,
+            org,
+            collection,
         } => commands::add(
             &name,
             user.as_deref(),
@@ -417,6 +449,8 @@ fn main() {
                 .map(|uri| (uri.clone(), None))
                 .collect::<Vec<_>>(),
             folder.as_deref(),
+            org.as_deref(),
+            &collection,
         ),
         Opt::Generate {
             len,
@@ -424,6 +458,8 @@ fn main() {
             user,
             uri,
             folder,
+            org,
+            collection,
             no_symbols,
             only_numbers,
             nonconfusables,
@@ -449,6 +485,8 @@ fn main() {
                     .map(|uri| (uri.clone(), None))
                     .collect::<Vec<_>>(),
                 folder.as_deref(),
+                org.as_deref(),
+                &collection,
                 len,
                 ty,
             )
@@ -550,5 +588,59 @@ fn main() {
     if let Err(e) = res {
         eprintln!("{e:#}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_cli() {
+        Opt::command().debug_assert();
+    }
+
+    // creating an entry in an organization requires a collection, and a
+    // collection is meaningless without an organization
+    #[test]
+    fn test_org_and_collection_require_each_other() {
+        for args in [
+            &["rbw", "add", "name", "--org", "org"][..],
+            &["rbw", "add", "name", "--collection", "collection"][..],
+            &["rbw", "generate", "12", "name", "--org", "org"][..],
+            &[
+                "rbw",
+                "generate",
+                "12",
+                "name",
+                "--collection",
+                "collection",
+            ][..],
+        ] {
+            assert!(Opt::try_parse_from(args).is_err(), "{args:?}");
+        }
+        for args in [
+            &[
+                "rbw",
+                "add",
+                "name",
+                "--org",
+                "org",
+                "--collection",
+                "collection",
+            ][..],
+            &[
+                "rbw",
+                "generate",
+                "12",
+                "name",
+                "--org",
+                "org",
+                "--collection",
+                "collection",
+            ][..],
+        ] {
+            assert!(Opt::try_parse_from(args).is_ok(), "{args:?}");
+        }
     }
 }

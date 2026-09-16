@@ -153,6 +153,7 @@ async fn sync_once(access_token: &str) -> Result<crate::api::SyncData> {
     client.sync(access_token).await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn add(
     access_token: &str,
     refresh_token: &str,
@@ -160,21 +161,42 @@ pub fn add(
     data: &crate::db::EntryData,
     notes: Option<&str>,
     folder_id: Option<&str>,
+    org_id: Option<&str>,
+    collection_ids: &[String],
 ) -> Result<(Option<String>, ())> {
     with_exchange_refresh_token(access_token, refresh_token, |access_token| {
-        add_once(access_token, name, data, notes, folder_id)
+        add_once(
+            access_token,
+            name,
+            data,
+            notes,
+            folder_id,
+            org_id,
+            collection_ids,
+        )
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn add_once(
     access_token: &str,
     name: &str,
     data: &crate::db::EntryData,
     notes: Option<&str>,
     folder_id: Option<&str>,
+    org_id: Option<&str>,
+    collection_ids: &[String],
 ) -> Result<()> {
     let (client, _) = api_client()?;
-    client.add(access_token, name, data, notes, folder_id)?;
+    client.add(
+        access_token,
+        name,
+        data,
+        notes,
+        folder_id,
+        org_id,
+        collection_ids,
+    )?;
     Ok(())
 }
 

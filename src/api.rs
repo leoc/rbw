@@ -781,6 +781,8 @@ struct CiphersPostReq {
     ty: u32, // XXX what are the valid types?
     #[serde(rename = "folderId")]
     folder_id: Option<String>,
+    #[serde(rename = "organizationId")]
+    organization_id: Option<String>,
     name: String,
     notes: Option<String>,
     login: Option<CipherLogin>,
@@ -788,6 +790,16 @@ struct CiphersPostReq {
     identity: Option<CipherIdentity>,
     #[serde(rename = "secureNote")]
     secure_note: Option<CipherSecureNote>,
+}
+
+// creating a cipher in an organization requires the /ciphers/create
+// endpoint, which wraps the cipher in an envelope carrying the collection
+// ids
+#[derive(serde::Serialize, Debug)]
+struct CiphersCreateReq {
+    cipher: CiphersPostReq,
+    #[serde(rename = "collectionIds")]
+    collection_ids: Vec<String>,
 }
 
 #[derive(serde::Serialize, Debug)]
@@ -1238,6 +1250,7 @@ impl Client {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn add(
         &self,
         access_token: &str,
@@ -1245,10 +1258,13 @@ impl Client {
         data: &crate::db::EntryData,
         notes: Option<&str>,
         folder_id: Option<&str>,
+        org_id: Option<&str>,
+        collection_ids: &[String],
     ) -> Result<()> {
         let mut req = CiphersPostReq {
             ty: 1,
             folder_id: folder_id.map(std::string::ToString::to_string),
+            organization_id: org_id.map(std::string::ToString::to_string),
             name: name.to_string(),
             notes: notes.map(std::string::ToString::to_string),
             login: None,
@@ -1344,10 +1360,18 @@ impl Client {
             crate::db::EntryData::SshKey { .. } => unreachable!(),
         }
         let client = reqwest::blocking::Client::new();
-        let res = client
-            .post(self.api_url("/ciphers"))
+        let req = if org_id.is_some() {
+            client.post(self.api_url("/ciphers/create")).json(
+                &CiphersCreateReq {
+                    cipher: req,
+                    collection_ids: collection_ids.to_vec(),
+                },
+            )
+        } else {
+            client.post(self.api_url("/ciphers")).json(&req)
+        };
+        let res = req
             .header("Authorization", format!("Bearer {access_token}"))
-            .json(&req)
             .send()
             .map_err(|source| Error::Reqwest { source })?;
         match res.status() {

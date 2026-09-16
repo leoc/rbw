@@ -1635,6 +1635,8 @@ pub fn add(
     username: Option<&str>,
     uris: &[(String, Option<rbw::api::UriMatchType>)],
     folder: Option<&str>,
+    org: Option<&str>,
+    collections: &[String],
 ) -> anyhow::Result<()> {
     unlock()?;
 
@@ -1644,26 +1646,31 @@ pub fn add(
     let mut access_token = db.access_token.as_ref().unwrap().clone();
     let refresh_token = db.refresh_token.as_ref().unwrap();
 
-    let name = crate::actions::encrypt(name, None)?;
+    // ciphers in an organization are encrypted with the organization key
+    let (org_id, collection_ids) =
+        resolve_org_and_collections(&db, org, collections)?;
+    let org_id = org_id.as_deref();
+
+    let name = crate::actions::encrypt(name, org_id)?;
 
     let username = username
-        .map(|username| crate::actions::encrypt(username, None))
+        .map(|username| crate::actions::encrypt(username, org_id))
         .transpose()?;
 
     let contents = rbw::edit::edit("", HELP_PW)?;
 
     let (password, notes) = parse_editor(&contents);
     let password = password
-        .map(|password| crate::actions::encrypt(&password, None))
+        .map(|password| crate::actions::encrypt(&password, org_id))
         .transpose()?;
     let notes = notes
-        .map(|notes| crate::actions::encrypt(&notes, None))
+        .map(|notes| crate::actions::encrypt(&notes, org_id))
         .transpose()?;
     let uris: Vec<_> = uris
         .iter()
         .map(|uri| {
             Ok(rbw::db::Uri {
-                uri: crate::actions::encrypt(&uri.0, None)?,
+                uri: crate::actions::encrypt(&uri.0, org_id)?,
                 match_type: uri.1,
             })
         })
@@ -1719,6 +1726,8 @@ pub fn add(
         },
         notes.as_deref(),
         folder_id.as_deref(),
+        org_id,
+        &collection_ids,
     )? {
         db.access_token = Some(access_token);
         save_db(&db)?;
@@ -1734,11 +1743,12 @@ pub fn generate(
     username: Option<&str>,
     uris: &[(String, Option<rbw::api::UriMatchType>)],
     folder: Option<&str>,
+    org: Option<&str>,
+    collections: &[String],
     len: usize,
     ty: rbw::pwgen::Type,
 ) -> anyhow::Result<()> {
     let password = rbw::pwgen::pwgen(ty, len);
-    println!("{password}");
 
     if let Some(name) = name {
         unlock()?;
@@ -1749,16 +1759,25 @@ pub fn generate(
         let mut access_token = db.access_token.as_ref().unwrap().clone();
         let refresh_token = db.refresh_token.as_ref().unwrap();
 
-        let name = crate::actions::encrypt(name, None)?;
+        // ciphers in an organization are encrypted with the organization
+        // key. resolve names before printing the password, so that a
+        // password that can't be saved isn't printed.
+        let (org_id, collection_ids) =
+            resolve_org_and_collections(&db, org, collections)?;
+        let org_id = org_id.as_deref();
+
+        println!("{password}");
+
+        let name = crate::actions::encrypt(name, org_id)?;
         let username = username
-            .map(|username| crate::actions::encrypt(username, None))
+            .map(|username| crate::actions::encrypt(username, org_id))
             .transpose()?;
-        let password = crate::actions::encrypt(&password, None)?;
+        let password = crate::actions::encrypt(&password, org_id)?;
         let uris: Vec<_> = uris
             .iter()
             .map(|uri| {
                 Ok(rbw::db::Uri {
-                    uri: crate::actions::encrypt(&uri.0, None)?,
+                    uri: crate::actions::encrypt(&uri.0, org_id)?,
                     match_type: uri.1,
                 })
             })
@@ -1814,12 +1833,16 @@ pub fn generate(
             },
             None,
             folder_id.as_deref(),
+            org_id,
+            &collection_ids,
         )? {
             db.access_token = Some(access_token);
             save_db(&db)?;
         }
 
         crate::actions::sync()?;
+    } else {
+        println!("{password}");
     }
 
     Ok(())
@@ -2386,6 +2409,65 @@ fn resolve_filters(
         })
         .transpose()?;
     Ok((org_ids, collection_ids))
+}
+
+// resolves an organization name and collection names to ids for creating a
+// new cipher. unlike the search filters, this must resolve each name to
+// exactly one id.
+fn resolve_org_and_collections(
+    db: &rbw::db::Db,
+    org: Option<&str>,
+    collections: &[String],
+) -> anyhow::Result<(Option<String>, Vec<String>)> {
+    let Some(org_name) = org else {
+        return Ok((None, vec![]));
+    };
+    let org_ids = resolve_org_filter(&db.organizations, org_name, false)?;
+    if org_ids.len() > 1 {
+        return Err(anyhow::anyhow!(
+            "multiple organizations found matching '{org_name}'"
+        ));
+    }
+    let org_id = org_ids.into_iter().next().unwrap();
+    if collections.is_empty() {
+        return Err(anyhow::anyhow!(
+            "an organization item must be placed in at least one \
+            collection (use --collection)"
+        ));
+    }
+    let collection_ids =
+        resolve_collection_names(db, &org_id, collections, false)?;
+    Ok((Some(org_id), collection_ids))
+}
+
+// resolves collection names to ids within a single organization. each name
+// must resolve to exactly one id.
+fn resolve_collection_names(
+    db: &rbw::db::Db,
+    org_id: &str,
+    collections: &[String],
+    ignore_case: bool,
+) -> anyhow::Result<Vec<String>> {
+    let names = collection_map(db, Some(org_id));
+    let org_id_filter: std::collections::HashSet<String> =
+        std::iter::once(org_id.to_string()).collect();
+    let mut collection_ids = Vec::new();
+    for name in collections {
+        let ids = resolve_collection_filter(
+            &db.collections,
+            &names,
+            Some(&org_id_filter),
+            name,
+            ignore_case,
+        )?;
+        if ids.len() > 1 {
+            return Err(anyhow::anyhow!(
+                "multiple collections found matching '{name}'"
+            ));
+        }
+        collection_ids.push(ids.into_iter().next().unwrap());
+    }
+    Ok(collection_ids)
 }
 
 fn entry_matches_filters(
