@@ -1854,6 +1854,7 @@ pub fn edit(
     folder: Option<&str>,
     org: Option<&str>,
     collection: Option<&str>,
+    set_collections: &[String],
     ignore_case: bool,
 ) -> anyhow::Result<()> {
     unlock()?;
@@ -1871,6 +1872,38 @@ pub fn edit(
     let (entry, decrypted) =
         find_entry(&db, name, username, folder, org, collection, ignore_case)
             .with_context(|| format!("couldn't find entry for '{desc}'"))?;
+
+    // --set-collection only changes which collections the entry belongs
+    // to, without editing its contents (so it works for every entry type
+    // and doesn't open an editor). moving an entry between collections
+    // doesn't require re-encryption, since all collections of an
+    // organization share the organization key.
+    if !set_collections.is_empty() {
+        let Some(org_id) = entry.org_id.as_deref() else {
+            return Err(anyhow::anyhow!(
+                "'{desc}' is not an organization entry, so it can't be \
+                placed in a collection"
+            ));
+        };
+        let collection_ids = resolve_collection_names(
+            &db,
+            org_id,
+            set_collections,
+            ignore_case,
+        )?;
+        if let (Some(access_token), ()) = rbw::actions::set_collections(
+            access_token,
+            refresh_token,
+            &entry.id,
+            &collection_ids,
+        )? {
+            db.access_token = Some(access_token);
+            save_db(&db)?;
+        }
+
+        crate::actions::sync()?;
+        return Ok(());
+    }
 
     let (data, fields, notes, history) = match &decrypted.data {
         DecryptedData::Login { password, .. } => {

@@ -249,6 +249,15 @@ enum Opt {
     Edit {
         #[command(flatten)]
         find_args: FindArgs,
+        #[arg(
+            long,
+            help = "Set the collections the entry belongs to, replacing \
+                its current collections, without editing its contents \
+                (only valid for entries in an organization, may be given \
+                multiple times)",
+            number_of_values = 1
+        )]
+        set_collection: Vec<String>,
     },
 
     #[command(about = "Remove a given entry", visible_alias = "rm")]
@@ -491,12 +500,16 @@ fn main() {
                 ty,
             )
         }
-        Opt::Edit { find_args } => commands::edit(
+        Opt::Edit {
+            find_args,
+            set_collection,
+        } => commands::edit(
             find_args.needle,
             find_args.user.as_deref(),
             find_args.folder.as_deref(),
             find_args.org.as_deref(),
             find_args.collection.as_deref(),
+            &set_collection,
             find_args.ignorecase,
         ),
         Opt::Remove { find_args } => commands::remove(

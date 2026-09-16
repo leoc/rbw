@@ -253,6 +253,27 @@ fn edit_once(
     Ok(())
 }
 
+pub fn set_collections(
+    access_token: &str,
+    refresh_token: &str,
+    id: &str,
+    collection_ids: &[String],
+) -> Result<(Option<String>, ())> {
+    with_exchange_refresh_token(access_token, refresh_token, |access_token| {
+        set_collections_once(access_token, id, collection_ids)
+    })
+}
+
+fn set_collections_once(
+    access_token: &str,
+    id: &str,
+    collection_ids: &[String],
+) -> Result<()> {
+    let (client, _) = api_client()?;
+    client.set_collections(access_token, id, collection_ids)?;
+    Ok(())
+}
+
 pub fn remove(
     access_token: &str,
     refresh_token: &str,

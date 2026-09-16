@@ -823,6 +823,12 @@ struct CiphersPutReq {
 }
 
 #[derive(serde::Serialize, Debug)]
+struct CiphersIdCollectionsPutReq {
+    #[serde(rename = "collectionIds")]
+    collection_ids: Vec<String>,
+}
+
+#[derive(serde::Serialize, Debug)]
 struct CiphersPutReqHistory {
     #[serde(rename = "LastUsedDate")]
     last_used_date: String,
@@ -1520,6 +1526,34 @@ impl Client {
         let client = reqwest::blocking::Client::new();
         let res = client
             .put(self.api_url(&format!("/ciphers/{id}")))
+            .header("Authorization", format!("Bearer {access_token}"))
+            .json(&req)
+            .send()
+            .map_err(|source| Error::Reqwest { source })?;
+        match res.status() {
+            reqwest::StatusCode::OK => Ok(()),
+            reqwest::StatusCode::UNAUTHORIZED => {
+                Err(Error::RequestUnauthorized)
+            }
+            _ => Err(Error::RequestFailed {
+                status: res.status().as_u16(),
+            }),
+        }
+    }
+
+    // replaces the set of collections an organization cipher belongs to
+    pub fn set_collections(
+        &self,
+        access_token: &str,
+        id: &str,
+        collection_ids: &[String],
+    ) -> Result<()> {
+        let req = CiphersIdCollectionsPutReq {
+            collection_ids: collection_ids.to_vec(),
+        };
+        let client = reqwest::blocking::Client::new();
+        let res = client
+            .put(self.api_url(&format!("/ciphers/{id}/collections")))
             .header("Authorization", format!("Bearer {access_token}"))
             .json(&req)
             .send()
